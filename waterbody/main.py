@@ -41,7 +41,7 @@ to be done:
     2.checkpoint √
     3.measurement √
     4.add scaler of apex
-    5.add evaluation
+    5.add evaluation √
 """
 
 # python >= 3.7
@@ -62,18 +62,19 @@ class args(object):
     
     # train
     image_size : int = 256
-    
-    log_freq : int = 100
     start_epoch : int = 0 
     epochs : int = 100
     per_device_batch_size : int = 16
     resume : bool = False
     seed : int  = None
     
+    # eval
+    val_batch_size : int = 32
+    
     # checkpoint
     save_dir : str = "./checkpoint/"
-    # resume : Optional[str] = None
-    resume : str = "./checkpoint/checkpoint-test.pth"
+    resume : Optional[str] = None
+    # resume : str = "./checkpoint/checkpoint-test.pth"
     
     # optim
     base_lr : float = 1e-3
@@ -84,7 +85,7 @@ class args(object):
     task_mode : str = "seg"
     
     # log (within one epoch)
-    print_freq = 1
+    print_freq = 10
     
     # eval 
     eval_freq = 1
@@ -105,7 +106,43 @@ train_t = transforms.Compose([
 val_t = transforms.Compose([
     NpTranspose(mode=args.task_mode)])
 
+
+# evaluate 
+# A simple mode is employed, only when master.
+@torch.no_grad()
+def evaluate(data_loader,model,device):
+    # criterion = torch.nn.CrossEntropy()
     
+    model.eval()
+    total_conf_mat = 0
+    for iter_step, batch_data in tqdm(enumerate(data_loader,start=0)):
+    # for batch_data in metric_logger.log_every(data_loader, print_freq=10,header=header):
+        image = batch_data["image"]
+        label = batch_data["label"]
+        if torch.cuda.is_available():
+            image = image.to(device,non_blocking=True)
+            label = label.to(device,non_blocking=True)
+        
+        pred_proba = model(image)
+        cls_num = pred_proba.size(1)
+        _,pred_cls = torch.max(pred_proba,1)
+        
+        pred_cls = pred_cls.cpu().numpy().squeeze().astype(np.uint8)
+        label = label.cpu().numpy().squeeze().astype(np.uint8)
+        
+        conf_mat = get_confusion_matrix(pred = pred_cls.flatten(), 
+                                        target = label.flatten(), 
+                                        cls_num = cls_num)
+        total_conf_mat += conf_mat
+    accu,accu_per_cls,accu_cls,iou,mean_iou,fw_iou,kappa = compute_metrics(total_conf_mat)
+    
+    eval_metrics = { "accu":accu,"accu_per_cls":accu_per_cls,"accu_cls":accu_cls,
+                    "iou":iou,"mean_iou":mean_iou,"fw_iou":fw_iou,
+                    "kappa":kappa
+                    }
+    
+    model.train()
+    return eval_metrics
 
 if __name__=="__main__":
     print("main supervised learning process")
@@ -144,22 +181,26 @@ if __name__=="__main__":
         model_wo_ddp = model.module
     
     loss_fcn = nn.CrossEntropyLoss()
-    optim_params = model.parameters()
-    optimizer = torch.optim.Adam(optim_params,lr=args.base_lr,weight_decay=args.weight_decay)
+    # optim_params = model.parameters()
+    # optimizer = torch.optim.Adam(optim_params,lr=args.base_lr,weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model_wo_ddp.parameters(),lr=args.base_lr,weight_decay=args.weight_decay)
+    
     
     loss_scaler = torch.amp.GradScaler() if is_distributed() else None 
     
     # load model
     load_model(args,model_wo_ddp=model_wo_ddp,optimizer=optimizer,loss_scaler=loss_scaler)
     
-    
+    # dataloader
     # The DistributedSampler has built-in shuffle logic.
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.per_device_batch_size,
                                                num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
-    
+    # val loader
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.val_batch_size)
     
     
     optimizer.zero_grad()
+    save_index = -1
     for _epoch in range(args.start_epoch,args.epochs):
         
         model.train(True)
@@ -167,15 +208,25 @@ if __name__=="__main__":
         # eval & save
         if (_epoch+1)%args.eval_freq == 0:
             print("model evaluation")
-            save_model(args,epoch=_epoch,model_wo_ddp=model_wo_ddp,optimizer=optimizer,loss_scaler=None)
-
-        
+            if get_rank() == 0:
+                eval_metrics = evaluate(data_loader = val_loader, 
+                                        model = model, 
+                                        device = args.device)
+                max_key_length = max(len(key) for key in eval_metrics.keys())
+                for key, value in eval_metrics.items():
+                    print(f"{key.ljust(max_key_length)}: {value}")
+                if eval_metrics["accu"]>save_index:
+                    save_index = eval_metrics["accu"]
+                    save_model(args,epoch=_epoch,model_wo_ddp=model_wo_ddp,optimizer=optimizer,loss_scaler=None)
+            # save_model(args,epoch=_epoch,model_wo_ddp=model_wo_ddp,optimizer=optimizer,loss_scaler=None)
+            
         # log info
         metric_logger = MetricLogger(delimiter="  ")
         metric_logger.add_meter(name="lr", meter=SmoothedValue(window_size=1,fmt="{value:.6f}"))
         header = "Epoch:[{} / {}]".format(_epoch,args.epochs)
         print_freq = args.print_freq
         
+        # train one epoch
         # enumerate(iterable,start)
         # for data_iter_step,batch_data in enumerate(train_loader,0):
         for data_iter_step,batch_data in enumerate(metric_logger.log_every(train_loader, print_freq=print_freq,header=header)):
